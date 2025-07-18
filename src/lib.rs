@@ -1,13 +1,20 @@
 use anyhow::{Context as _, Result};
 use binaryninja::{
-    binary_view::{BinaryView, BinaryViewExt},
+    binary_view::{BinaryView, BinaryViewBase, BinaryViewExt},
     command::{self, Command},
     logger::Logger,
 };
 use log::{error, info};
-use pdb_sdk::Guid;
-use pdb_sdk::builders::PdbBuilder;
-use pdb_sdk::dbi::SectionHeader;
+use pdb_sdk::builders::{ModuleBuilder, PdbBuilder};
+use pdb_sdk::codeview::DataRegionOffset;
+use pdb_sdk::codeview::symbols::{Procedure, ProcedureProperties, SymbolRecord};
+use pdb_sdk::codeview::types::{CallingConvention, FunctionProperties, TypeRecord};
+use pdb_sdk::dbi::{SectionContrib, SectionHeader};
+use pdb_sdk::utils::StrBuf;
+use pdb_sdk::{
+    Guid,
+    codeview::symbols::{Public, PublicProperties},
+};
 use std::io::BufWriter;
 use std::path::PathBuf;
 use std::{collections::HashMap, fs};
@@ -33,7 +40,6 @@ impl Command for GenPdb {
     }
 
     fn valid(&self, view: &BinaryView) -> bool {
-        // Check if this is a PE file and has the necessary symbols
         view.view_type() == "PE"
             && !view.symbols_by_name("__coff_header").is_empty()
             && !view.symbols_by_name("PDBGuid").is_empty()
@@ -83,7 +89,8 @@ fn gen_pdb(view: &BinaryView) -> Result<()> {
     builder.info().age(pdb_info.age);
     builder.info().signature(pdb_info.timestamp);
 
-    build_sections(view, &mut builder)?;
+    let section_info = build_sections(view, &mut builder)?;
+    build_functions(view, &mut builder, &section_info)?;
 
     let exe_path = PathBuf::from(view.file().filename());
     let pdb_path = exe_path.with_extension("pdb");
@@ -98,7 +105,16 @@ fn gen_pdb(view: &BinaryView) -> Result<()> {
     Ok(())
 }
 
-fn build_sections(view: &BinaryView, builder: &mut PdbBuilder) -> Result<()> {
+#[derive(Debug)]
+struct SectionInfo {
+    name: String,
+    index: u16,
+    virtual_address: u32,
+    virtual_size: u32,
+    characteristics: u32,
+}
+
+fn build_sections(view: &BinaryView, builder: &mut PdbBuilder) -> Result<Vec<SectionInfo>> {
     let section_headers_sym = view
         .symbol_by_raw_name("__section_headers")
         .context("could not find __section_headers symbol")?;
@@ -133,6 +149,8 @@ fn build_sections(view: &BinaryView, builder: &mut PdbBuilder) -> Result<()> {
     let section_headers_addr = section_headers_sym.address();
     let section_header_size = section_header_type.width();
 
+    let mut sections = Vec::new();
+
     for i in 0..num_sections {
         let header_addr = section_headers_addr + i * section_header_size;
 
@@ -162,6 +180,14 @@ fn build_sections(view: &BinaryView, builder: &mut PdbBuilder) -> Result<()> {
             .trim_end_matches('\0');
         info!("Adding section: {name_str} (VA: 0x{virtual_address:x}, Size: 0x{virtual_size:x})",);
 
+        sections.push(SectionInfo {
+            name: name_str.to_string(),
+            index: (i as u16) + 1, // Section indices are 1-based in PDB
+            virtual_address,
+            virtual_size,
+            characteristics,
+        });
+
         builder.dbi().add_section_header(SectionHeader {
             name,
             virtual_size,
@@ -174,6 +200,132 @@ fn build_sections(view: &BinaryView, builder: &mut PdbBuilder) -> Result<()> {
             number_of_line_numbers,
             characteristics,
         });
+    }
+
+    Ok(sections)
+}
+
+fn build_functions(
+    view: &BinaryView,
+    builder: &mut PdbBuilder,
+    sections: &[SectionInfo],
+) -> Result<()> {
+    let void_fn_type = {
+        let tpi = builder.tpi();
+
+        let arg_list = tpi.add(
+            "args",
+            TypeRecord::ArgList {
+                count: 0,
+                arg_list: vec![],
+            },
+        );
+
+        tpi.add(
+            "void_func",
+            TypeRecord::Procedure {
+                return_type: None,
+                calling_conv: CallingConvention::NearC,
+                properties: FunctionProperties::new(),
+                arg_count: 0,
+                arg_list,
+            },
+        )
+    };
+
+    let base_address = view.start();
+    let mut functions_by_section: HashMap<u16, Vec<_>> = HashMap::new();
+
+    let func_iter = view.functions();
+    for function in &func_iter {
+        let func_addr = function.start();
+
+        for section in sections {
+            let section_start = base_address + section.virtual_address as u64;
+            let section_end = section_start + section.virtual_size as u64;
+
+            if func_addr >= section_start && func_addr < section_end {
+                functions_by_section
+                    .entry(section.index)
+                    .or_insert_with(Vec::new)
+                    .push(function);
+                break;
+            }
+        }
+    }
+
+    for (section_idx, functions) in functions_by_section {
+        let section = sections
+            .iter()
+            .find(|s| s.index == section_idx)
+            .context("section not found")?;
+
+        info!(
+            "Creating module for section {} with {} functions",
+            section.name,
+            functions.len()
+        );
+
+        let sec_contrib = SectionContrib {
+            i_sect: section_idx,
+            pad1: [0, 0],
+            offset: 0,
+            size: section.virtual_size,
+            characteristics: section.characteristics,
+            i_mod: 0,
+            pad2: [0, 0],
+            data_crc: 0,
+            reloc_crc: 0,
+        };
+
+        let mut module = ModuleBuilder::new(
+            format!("{}_module", section.name),
+            format!("/fake/path/{}.obj", section.name),
+            sec_contrib,
+        );
+
+        for function in functions {
+            let func_name = function.symbol().short_name();
+            let func_name = func_name.to_string_lossy();
+            let func_start = function.start();
+            let func_size = function.highest_address() - function.start();
+
+            let section_start = base_address + section.virtual_address as u64;
+            let func_offset = (func_start - section_start) as u32;
+
+            info!(
+                "  Adding function: {func_name} at offset 0x{func_offset:x} (size: 0x{func_size:x})"
+            );
+
+            // add to module
+            let proc_idx = module.symbols.len();
+            module.add_symbol(SymbolRecord::GlobalProc(Procedure {
+                parent: None,
+                end: 0.into(),
+                next: None,
+                code_size: func_size as u32,
+                dbg_start_offset: 0,
+                dbg_end_offset: 0,
+                function_type: void_fn_type,
+                code_offset: DataRegionOffset::new(func_offset, section_idx),
+                properties: ProcedureProperties::new(),
+                name: StrBuf::new(func_name.clone()),
+            }));
+            let end_idx = module.add_symbol(SymbolRecord::ProcEnd);
+            match &mut module.symbols[proc_idx] {
+                SymbolRecord::GlobalProc(proc) => proc.end = end_idx,
+                _ => unreachable!(),
+            }
+
+            // add to publics table
+            builder.dbi().symbols().add(Public {
+                properties: PublicProperties::new().with_is_function(true),
+                offset: DataRegionOffset::new(func_offset, section_idx),
+                name: StrBuf::new(func_name),
+            });
+        }
+
+        builder.dbi().add_module(module);
     }
 
     Ok(())
