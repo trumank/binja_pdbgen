@@ -10,3 +10,4 @@ crate-type = ["cdylib"]
 anyhow = "1.0.98"
 binaryninja = {git = "https://github.com/Vector35/binaryninja-api.git", branch = "dev"}
 log = "0.4.27"
+pdb-sdk = { git = "https://github.com/trumank/pdb-sdk", version = "0.1.0" }
