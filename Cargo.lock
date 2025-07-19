@@ -273,7 +273,7 @@ dependencies = [
 [[package]]
 name = "pdb-sdk"
 version = "0.1.0"
-source = "git+https://github.com/trumank/pdb-sdk#103dfce2e6315765f1a7f9af9ce99871333b48c0"
+source = "git+https://github.com/jac3km4/pdb-sdk#103dfce2e6315765f1a7f9af9ce99871333b48c0"
 dependencies = [
  "declio",
  "derive-getters",
