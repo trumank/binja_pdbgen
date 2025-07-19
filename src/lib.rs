@@ -2,7 +2,6 @@ use anyhow::{Context as _, Result};
 use binaryninja::{
     binary_view::{BinaryView, BinaryViewBase, BinaryViewExt},
     command::{self, Command},
-    function::Function,
     logger::Logger,
 };
 use log::{error, info, warn};
@@ -206,22 +205,6 @@ fn build_sections(view: &BinaryView, builder: &mut PdbBuilder) -> Result<Vec<Sec
     Ok(sections)
 }
 
-fn calculate_function_size(function: &Function) -> Option<u64> {
-    let mut ranges = function.address_ranges().to_vec();
-    ranges.sort_by_key(|r| r.start);
-
-    for i in 1..ranges.len() {
-        let prev = &ranges[i - 1];
-        let curr = &ranges[i];
-
-        if prev.end != curr.start {
-            return None;
-        }
-    }
-
-    Some(ranges.iter().map(|r| r.end - r.start).sum())
-}
-
 fn build_functions(
     view: &BinaryView,
     builder: &mut PdbBuilder,
@@ -278,6 +261,8 @@ fn build_functions(
             .find(|s| s.index == section_idx)
             .context("section not found")?;
 
+        let section_start = base_address + section.virtual_address as u64;
+
         info!(
             "Creating module for section {} with {} functions",
             section.name,
@@ -305,49 +290,48 @@ fn build_functions(
         for function in functions {
             let func_name = function.symbol().short_name();
             let func_name = func_name.to_string_lossy();
-            let func_start = function.start();
 
-            let Some(func_size) = calculate_function_size(&function) else {
-                // TODO define sub-functions for any function that are non-linear
-                warn!(
-                    "  Function 0x{func_start:x} {func_name} has non-linear basic blocks, skipping"
-                );
-                continue;
-            };
+            for (i, range) in function.address_ranges().iter().enumerate() {
+                let func_start = range.start;
+                let func_size = range.end - range.start;
+                let func_offset = (func_start - section_start) as u32;
+                let func_name = if i == 0 {
+                    func_name.clone()
+                } else {
+                    format!("{func_name}_part{}", i + 1).into()
+                };
 
-            let section_start = base_address + section.virtual_address as u64;
-            let func_offset = (func_start - section_start) as u32;
+                // info!(
+                //     "  Adding function: 0x{func_start:x} {func_name} at offset 0x{func_offset:x} (size: 0x{func_size:x})"
+                // );
 
-            info!(
-                "  Adding function: 0x{func_start:x} {func_name} at offset 0x{func_offset:x} (size: 0x{func_size:x})"
-            );
+                // add to module
+                let proc_idx = module.symbols.len();
+                module.add_symbol(SymbolRecord::GlobalProc(Procedure {
+                    parent: None,
+                    end: 0.into(),
+                    next: None,
+                    code_size: func_size as u32,
+                    dbg_start_offset: 0,
+                    dbg_end_offset: 0,
+                    function_type: void_fn_type,
+                    code_offset: DataRegionOffset::new(func_offset, section_idx),
+                    properties: ProcedureProperties::new(),
+                    name: StrBuf::new(func_name.clone()),
+                }));
+                let end_idx = module.add_symbol(SymbolRecord::ProcEnd);
+                match &mut module.symbols[proc_idx] {
+                    SymbolRecord::GlobalProc(proc) => proc.end = end_idx,
+                    _ => unreachable!(),
+                }
 
-            // add to module
-            let proc_idx = module.symbols.len();
-            module.add_symbol(SymbolRecord::GlobalProc(Procedure {
-                parent: None,
-                end: 0.into(),
-                next: None,
-                code_size: func_size as u32,
-                dbg_start_offset: 0,
-                dbg_end_offset: 0,
-                function_type: void_fn_type,
-                code_offset: DataRegionOffset::new(func_offset, section_idx),
-                properties: ProcedureProperties::new(),
-                name: StrBuf::new(func_name.clone()),
-            }));
-            let end_idx = module.add_symbol(SymbolRecord::ProcEnd);
-            match &mut module.symbols[proc_idx] {
-                SymbolRecord::GlobalProc(proc) => proc.end = end_idx,
-                _ => unreachable!(),
+                // add to publics table
+                builder.dbi().symbols().add(Public {
+                    properties: PublicProperties::new().with_is_function(true),
+                    offset: DataRegionOffset::new(func_offset, section_idx),
+                    name: StrBuf::new(func_name),
+                });
             }
-
-            // add to publics table
-            builder.dbi().symbols().add(Public {
-                properties: PublicProperties::new().with_is_function(true),
-                offset: DataRegionOffset::new(func_offset, section_idx),
-                name: StrBuf::new(func_name),
-            });
         }
 
         builder.dbi().add_module(module);
