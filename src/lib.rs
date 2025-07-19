@@ -92,7 +92,8 @@ fn gen_pdb(view: &BinaryView) -> Result<()> {
     let section_info = build_sections(view, &mut builder)?;
     build_functions(view, &mut builder, &section_info)?;
 
-    let exe_path = PathBuf::from(view.file().filename());
+    let filename = view.file().filename();
+    let exe_path = PathBuf::from(filename.strip_suffix(".bndb").unwrap_or(&filename));
     let pdb_path = exe_path.with_extension("pdb");
 
     info!("Writing PDB to: {}", pdb_path.display());
