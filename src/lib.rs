@@ -2,9 +2,10 @@ use anyhow::{Context as _, Result};
 use binaryninja::{
     binary_view::{BinaryView, BinaryViewBase, BinaryViewExt},
     command::{self, Command},
+    function::Function,
     logger::Logger,
 };
-use log::{error, info};
+use log::{error, info, warn};
 use pdb_sdk::builders::{ModuleBuilder, PdbBuilder};
 use pdb_sdk::codeview::DataRegionOffset;
 use pdb_sdk::codeview::symbols::{Procedure, ProcedureProperties, SymbolRecord};
@@ -205,6 +206,22 @@ fn build_sections(view: &BinaryView, builder: &mut PdbBuilder) -> Result<Vec<Sec
     Ok(sections)
 }
 
+fn calculate_function_size(function: &Function) -> Option<u64> {
+    let mut ranges = function.address_ranges().to_vec();
+    ranges.sort_by_key(|r| r.start);
+
+    for i in 1..ranges.len() {
+        let prev = &ranges[i - 1];
+        let curr = &ranges[i];
+
+        if prev.end != curr.start {
+            return None;
+        }
+    }
+
+    Some(ranges.iter().map(|r| r.end - r.start).sum())
+}
+
 fn build_functions(
     view: &BinaryView,
     builder: &mut PdbBuilder,
@@ -244,13 +261,14 @@ fn build_functions(
             let section_start = base_address + section.virtual_address as u64;
             let section_end = section_start + section.virtual_size as u64;
 
-            if func_addr >= section_start && func_addr < section_end {
+            if (section_start..section_end).contains(&func_addr) {
                 functions_by_section
                     .entry(section.index)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(function);
                 break;
             }
+            warn!("Function 0x{func_addr:x} is not inside any section");
         }
     }
 
@@ -288,13 +306,20 @@ fn build_functions(
             let func_name = function.symbol().short_name();
             let func_name = func_name.to_string_lossy();
             let func_start = function.start();
-            let func_size = function.highest_address() - function.start();
+
+            let Some(func_size) = calculate_function_size(&function) else {
+                // TODO define sub-functions for any function that are non-linear
+                warn!(
+                    "  Function 0x{func_start:x} {func_name} has non-linear basic blocks, skipping"
+                );
+                continue;
+            };
 
             let section_start = base_address + section.virtual_address as u64;
             let func_offset = (func_start - section_start) as u32;
 
             info!(
-                "  Adding function: {func_name} at offset 0x{func_offset:x} (size: 0x{func_size:x})"
+                "  Adding function: 0x{func_start:x} {func_name} at offset 0x{func_offset:x} (size: 0x{func_size:x})"
             );
 
             // add to module
