@@ -267,6 +267,60 @@ fn build_sections(view: &BinaryView, builder: &mut PdbBuilder) -> Result<Vec<Sec
     Ok(sections)
 }
 
+fn merge_function_ranges(
+    ranges: &[std::ops::Range<u64>],
+    max_gap: u64,
+    view: &BinaryView,
+    current_function: &binaryninja::function::Function,
+) -> Vec<std::ops::Range<u64>> {
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sorted_ranges: Vec<_> = ranges.to_vec();
+    sorted_ranges.sort_by_key(|r| r.start);
+
+    let mut merged = Vec::new();
+    let mut current_start = sorted_ranges[0].start;
+    let mut current_end = sorted_ranges[0].end;
+
+    for range in sorted_ranges.iter().skip(1) {
+        let gap_start = current_end;
+        let gap_end = range.start;
+        let gap_size = gap_end - gap_start;
+
+        if gap_size <= max_gap {
+            // Check if any other function occupies the gap
+            let mut gap_occupied = false;
+            for addr in gap_start..gap_end {
+                if view
+                    .functions_containing(addr)
+                    .iter()
+                    .any(|f| &*f != current_function)
+                {
+                    gap_occupied = true;
+                    break;
+                }
+            }
+
+            if !gap_occupied {
+                current_end = current_end.max(range.end);
+            } else {
+                merged.push(current_start..current_end);
+                current_start = range.start;
+                current_end = range.end;
+            }
+        } else {
+            merged.push(current_start..current_end);
+            current_start = range.start;
+            current_end = range.end;
+        }
+    }
+
+    merged.push(current_start..current_end);
+    merged
+}
+
 fn build_functions(
     view: &BinaryView,
     builder: &mut PdbBuilder,
@@ -353,7 +407,14 @@ fn build_functions(
             let func_name = function.symbol().short_name();
             let func_name = func_name.to_string_lossy();
 
-            for (i, range) in function.address_ranges().iter().enumerate() {
+            let original_ranges: Vec<_> = function
+                .address_ranges()
+                .iter()
+                .map(|r| r.start..r.end)
+                .collect();
+            let merged_ranges = merge_function_ranges(&original_ranges, 16, view, &function);
+
+            for (i, range) in merged_ranges.iter().enumerate() {
                 let func_start = range.start;
                 let func_size = range.end - range.start;
                 let func_offset = (func_start - section_start) as u32;
