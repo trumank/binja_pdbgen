@@ -3,9 +3,7 @@ use binaryninja::{
     binary_view::{BinaryView, BinaryViewBase, BinaryViewExt},
     command::{self, Command},
     interaction::{MessageBoxButtonSet, MessageBoxIcon},
-    logger::Logger,
 };
-use log::{error, info, warn};
 use pdb::{FallibleIterator as _, PDB, SymbolData};
 use pdb_sdk::builders::{ModuleBuilder, PdbBuilder};
 use pdb_sdk::codeview::DataRegionOffset;
@@ -20,10 +18,11 @@ use pdb_sdk::{
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::{collections::HashMap, fs};
+use tracing::{error, info, warn};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn CorePluginInit() -> bool {
-    Logger::new("pdbgen").init();
+    binaryninja::tracing_init!("pdbgen");
 
     info!("pdbgen loaded");
 
@@ -111,7 +110,8 @@ fn gen_pdb(view: &BinaryView) -> Result<()> {
     let pdb_info = get_pdbinfo(view)?;
     info!("PdbInfo = {pdb_info:?}");
 
-    let filename = view.file().filename();
+    let filename = view.file().file_path();
+    let filename = filename.to_string_lossy();
     let exe_path = PathBuf::from(filename.strip_suffix(".bndb").unwrap_or(&filename));
     let pdb_path = exe_path.with_extension("pdb");
 
